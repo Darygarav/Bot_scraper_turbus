@@ -342,7 +342,7 @@ def click_purchase_button(driver) -> tuple[bool, str | Exception | None]:
         time.sleep(0.5)
         button.click()
         log("OK", "Botón 'Comprar' clickeado")
-        time.sleep(8)  # Esperar a que carguen los asientos
+        time.sleep(20)  # Esperar a que carguen los asientos
         return True, None
     except Exception as e:
         return False, e
@@ -367,10 +367,7 @@ def click_floor_button(driver, floor_number: int) -> tuple[bool, str | Exception
         if not floor_buttons:
             return False, "No se encontraron botones de piso"
         
-        # floor_number es 1-indexed, pero los botones también (Piso #1, Piso #2, etc.)
-        # Entonces intentamos acceder al índice floor_number - 1
-        if floor_number - 1 >= len(floor_buttons):
-            return False, f"Piso #{floor_number} no existe (solo hay {len(floor_buttons)} piso(s))"
+        
         
         button = floor_buttons[floor_number - 1]
         log("INFO", f"Haciendo click en Piso #{floor_number}...")
