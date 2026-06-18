@@ -74,6 +74,25 @@ def log(level: str, msg: str) -> None:
     print(f"[{ts}] [{level:5s}] {msg}")
 
 
+def abort(msg: str, driver=None, exit_code: int = 1, cause: str | Exception | None = None) -> None:
+    """
+    Detiene el proceso ante un fallo lógico (sin excepción).
+    Cierra el navegador si está abierto y sale con código distinto de cero.
+    """
+    log("ERROR", msg)
+    if cause is not None:
+        if isinstance(cause, Exception):
+            log("ERROR", f"Detalle: {type(cause).__name__}: {cause}")
+        else:
+            log("ERROR", f"Detalle: {cause}")
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    sys.exit(exit_code)
+
+
 # ---------------------------------------------------------------------------
 # Expresión regular para detectar horas en formato HH:MM (con AM/PM opcional)
 # ---------------------------------------------------------------------------
@@ -260,24 +279,24 @@ def open_browser(url: str, wait_seconds: int = 8, headless: bool = True, seleniu
 # Interacción con asientos del bus
 # ---------------------------------------------------------------------------
 
-def extract_available_seats(driver) -> list[str]:
+def extract_available_seats(driver) -> tuple[list[str], bool, str | None]:
     """
     Extrae los números de asientos disponibles del layout actual del bus.
     
     Busca elementos con clase 'icon-semi-bed-seat_available' y extrae el número
     del asiento desde el elemento <span> con clase 'seat_number__EfiN0'.
     
-    Retorna lista de strings con números de asientos (ej. ['1', '5', '12']).
+    Retorna (lista de asientos, layout_encontrado, detalle_error).
     """
     try:
         soup = BeautifulSoup(driver.page_source, "html.parser")
         available_seats = []
         
-        # Buscar todos los asientos disponibles (clase icon-semi-bed-seat_available)
         available_divs = soup.find_all(class_="icon-semi-bed-seat_available")
+        seat_numbers = soup.find_all(class_="seat_number__EfiN0")
+        layout_found = bool(seat_numbers or available_divs)
         
         for seat_div in available_divs:
-            # El número del asiento está en un <span> con clase 'seat_number__EfiN0' dentro del <li> padre
             li_parent = seat_div.find_parent('li')
             if li_parent:
                 seat_num_span = li_parent.find(class_="seat_number__EfiN0")
@@ -285,50 +304,50 @@ def extract_available_seats(driver) -> list[str]:
                     seat_num = seat_num_span.get_text(strip=True)
                     available_seats.append(seat_num)
         
-        return available_seats
+        if not layout_found:
+            detail = (
+                f"No se encontraron elementos del mapa de asientos "
+                f"(seat_number={len(seat_numbers)}, disponibles={len(available_divs)}, "
+                f"URL={driver.current_url})"
+            )
+            return available_seats, False, detail
+
+        return available_seats, True, None
     except Exception as e:
-        log("WARN", f"Error extrayendo asientos disponibles: {e}")
-        return []
+        return [], False, e
 
 
-def click_purchase_button(driver) -> bool:
+def click_purchase_button(driver) -> tuple[bool, str | Exception | None]:
     """
     Hace click en el botón "Comprar" para ver los asientos disponibles.
     
-    Retorna True si el click fue exitoso, False si hay error.
+    Retorna (éxito, detalle_error).
     """
     try:
-        # Buscar el botón con clase 'kupos-button'
-        button = driver.find_element(By.CSS_SELECTOR, "kupos-button_kupos_button__MM3z5")
-        driver.execute_script("arguments[0].scrollIntoView(true);", button)
+        button = driver.find_element(By.XPATH, "//button[.//span[text()='Comprar']]")
+        
         time.sleep(0.5)
         button.click()
         log("OK", "Botón 'Comprar' clickeado")
-        time.sleep(2)  # Esperar a que carguen los asientos
-        return True
+        time.sleep(8)  # Esperar a que carguen los asientos
+        return True, None
     except Exception as e:
-        log("WARN", f"No se pudo hacer click en botón Comprar: {e}")
-        return False
+        return False, e
 
 
-def go_back_from_seats(driver) -> bool:
+def go_back_from_seats(driver) -> tuple[bool, str | Exception | None]:
     """
     Vuelve atrás desde la pantalla de selección de asientos.
     
-    Intenta encontrar y hacer click en un botón de retroceso o usa
-    la función nativa del navegador.
-    
-    Retorna True si se logró volver, False si hay error.
+    Retorna (éxito, detalle_error).
     """
     try:
-        # Intentar con el botón back nativo del navegador
         driver.back()
         time.sleep(1)
         log("OK", "Navegador retrocedió a la lista de servicios")
-        return True
+        return True, None
     except Exception as e:
-        log("WARN", f"Error al intentar volver atrás: {e}")
-        return False
+        return False, e
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +489,7 @@ def extract_times_from_html(html: str) -> list[tuple]:
 
 def main():
     # Construir la URL default con la fecha de hoy en formato DD-MM-YYYY
-    today2 = '18-06-2026'
+    today2 = '19-06-2026'
     today = date.today().strftime("%d-%m-%Y")
     default_url = f"https://www.turbus.cl/es/pasajes-bus/vi%C3%B1a-del-mar,-chile/santiago,-chile?date_onward={today2}"
     
@@ -567,19 +586,35 @@ def main():
         log("INFO", f"Procesando {service_label}...")
         
         # Hacer click en el botón Comprar
-        if not click_purchase_button(driver):
-            log("WARN", f"  {service_label}: no se pudo abrir el modal de asientos")
-            services_with_seats.append((hora, precio, []))
-            continue
+        clicked, click_error = click_purchase_button(driver)
+        if not clicked:
+            abort(
+                f"{service_label}: no se pudo abrir la pantalla de asientos. Proceso detenido.",
+                driver=driver,
+                cause=click_error,
+            )
         
         # Extraer asientos disponibles
-        available_seats = extract_available_seats(driver)
-        log("OK", f"  {service_label}: {len(available_seats)} asiento(s) disponible(s): {', '.join(available_seats)}")
+        available_seats, layout_found, seats_error = extract_available_seats(driver)
+        if not layout_found:
+            abort(
+                f"{service_label}: no se pudo extraer el mapa de asientos. Proceso detenido.",
+                driver=driver,
+                cause=seats_error,
+            )
+
+        asientos_msg = ", ".join(available_seats) if available_seats else "(ninguno libre)"
+        log("OK", f"  {service_label}: {len(available_seats)} asiento(s) disponible(s): {asientos_msg}")
         services_with_seats.append((hora, precio, available_seats))
         
         # Volver a la lista de servicios
-        if not go_back_from_seats(driver):
-            log("WARN", f"  {service_label}: error al volver atrás, continuando...")
+        went_back, back_error = go_back_from_seats(driver)
+        if not went_back:
+            abort(
+                f"{service_label}: no se pudo volver a la lista de servicios. Proceso detenido.",
+                driver=driver,
+                cause=back_error,
+            )
         
         time.sleep(1)  # Pausa entre buses para no sobrecargar
 
