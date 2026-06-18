@@ -283,8 +283,10 @@ def extract_available_seats(driver) -> tuple[list[str], bool, str | None]:
     """
     Extrae los números de asientos disponibles del layout actual del bus.
     
-    Busca elementos con clase 'icon-semi-bed-seat_available' y extrae el número
-    del asiento desde el elemento <span> con clase 'seat_number__EfiN0'.
+    Busca elementos <li> que:
+    1. NO tengan la clase 'index_occupied__M0FaR' (para excluir ocupados)
+    2. Contengan un elemento con clase 'icon-semi-bed-seat_available'
+    3. Extrae el número desde el <span> con clase 'index_seat_number__EfiN0'
     
     Retorna (lista de asientos, layout_encontrado, detalle_error).
     """
@@ -292,23 +294,34 @@ def extract_available_seats(driver) -> tuple[list[str], bool, str | None]:
         soup = BeautifulSoup(driver.page_source, "html.parser")
         available_seats = []
         
-        available_divs = soup.find_all(class_="icon-semi-bed-seat_available")
-        seat_numbers = soup.find_all(class_="seat_number__EfiN0")
-        layout_found = bool(seat_numbers or available_divs)
+        # Buscar todos los <li> en el mapa de asientos
+        all_list_items = soup.find_all("li", class_=lambda x: x and "icon-semi-bed-seat" in x if x else False)
         
-        for seat_div in available_divs:
-            li_parent = seat_div.find_parent('li')
-            if li_parent:
-                seat_num_span = li_parent.find(class_="seat_number__EfiN0")
-                if seat_num_span:
-                    seat_num = seat_num_span.get_text(strip=True)
-                    available_seats.append(seat_num)
+        # Filtrar: mantener solo los que NO tienen clase "index_occupied__M0FaR"
+        # y que contienen un elemento con "icon-semi-bed-seat_available"
+        for li_item in all_list_items:
+            # Verificar que NO es un asiento ocupado
+            if "index_occupied__M0FaR" in li_item.get("class", []):
+                continue
+            
+            # Verificar que contiene un elemento disponible
+            available_div = li_item.find(class_="icon-semi-bed-seat_available")
+            if not available_div:
+                continue
+            
+            # Extraer el número del asiento
+            seat_num_span = li_item.find(class_="index_seat_number__EfiN0")
+            if seat_num_span:
+                seat_num = seat_num_span.get_text(strip=True)
+                available_seats.append(seat_num)
+        
+        # Verificar si encontramos el layout del bus
+        layout_found = len(all_list_items) > 0
         
         if not layout_found:
             detail = (
                 f"No se encontraron elementos del mapa de asientos "
-                f"(seat_number={len(seat_numbers)}, disponibles={len(available_divs)}, "
-                f"URL={driver.current_url})"
+                f"(URL={driver.current_url})"
             )
             return available_seats, False, detail
 
@@ -335,6 +348,40 @@ def click_purchase_button(driver) -> tuple[bool, str | Exception | None]:
         return False, e
 
 
+def click_floor_button(driver, floor_number: int) -> tuple[bool, str | Exception | None]:
+    """
+    Hace click en el botón del piso especificado (ej. "Piso #2").
+    
+    Busca el div con clase 'floor-buttons' y hace click en el elemento <a> 
+    que corresponde al piso especificado.
+    
+    Parámetros:
+      floor_number → número del piso (1, 2, 3, etc.)
+    
+    Retorna (éxito, detalle_error).
+    """
+    try:
+        # Buscar todos los botones de piso
+        floor_buttons = driver.find_elements(By.XPATH, "//div[contains(@class, 'floor-buttons')]//a")
+        
+        if not floor_buttons:
+            return False, "No se encontraron botones de piso"
+        
+        # floor_number es 1-indexed, pero los botones también (Piso #1, Piso #2, etc.)
+        # Entonces intentamos acceder al índice floor_number - 1
+        if floor_number - 1 >= len(floor_buttons):
+            return False, f"Piso #{floor_number} no existe (solo hay {len(floor_buttons)} piso(s))"
+        
+        button = floor_buttons[floor_number - 1]
+        log("INFO", f"Haciendo click en Piso #{floor_number}...")
+        button.click()
+        time.sleep(3)  # Esperar a que carguen los asientos del nuevo piso
+        log("OK", f"Piso #{floor_number} cargado")
+        return True, None
+    except Exception as e:
+        return False, e
+
+
 def go_back_from_seats(driver) -> tuple[bool, str | Exception | None]:
     """
     Vuelve atrás desde la pantalla de selección de asientos.
@@ -346,6 +393,123 @@ def go_back_from_seats(driver) -> tuple[bool, str | Exception | None]:
         time.sleep(1)
         log("OK", "Navegador retrocedió a la lista de servicios")
         return True, None
+    except Exception as e:
+        return False, e
+
+
+def scroll_to_element(driver, hora: str, smooth_speed: float = 0.5) -> tuple[bool, str | Exception | None]:
+    """
+    Realiza un scroll suave hasta encontrar y hacer visible el elemento que contiene la hora especificada.
+    
+    Parámetros:
+      hora → string con la hora (ej: "08:30")
+      smooth_speed → duración en segundos entre cada paso del scroll (más bajo = más rápido)
+    
+    Estrategia:
+      1. Busca el elemento que contiene el texto de la hora
+      2. Si no es visible, realiza scroll suave hacia él
+      3. Verifica que está en el viewport
+    
+    Retorna (éxito, detalle_error).
+    """
+    try:
+        # Buscar el elemento que contiene la hora
+        hora_element = driver.find_element(
+            By.XPATH, 
+            f"//div[contains(text(), '{hora}')]"
+        )
+        
+        log("INFO", f"Encontrado elemento con hora {hora}")
+        
+        # Obtener posición actual del elemento
+        location = hora_element.location
+        size = hora_element.size
+        
+        # Obtener el viewport (ventana visible)
+        window_height = driver.execute_script("return window.innerHeight")
+        scroll_position = driver.execute_script("return window.pageYOffset")
+        
+        # Calcular si el elemento está fuera del viewport
+        element_top = location['y']
+        element_bottom = location['y'] + size['height']
+        
+        viewport_top = scroll_position
+        viewport_bottom = scroll_position + window_height
+        
+        # Si el elemento no es visible, hacer scroll suave hacia él
+        if element_bottom > viewport_bottom or element_top < viewport_top:
+            log("INFO", f"Elemento fuera del viewport. Haciendo scroll suave hacia hora {hora}...")
+            
+            # Calcular la posición deseada (centrar el elemento en pantalla)
+            target_scroll = element_top - (window_height / 3)
+            current_scroll = scroll_position
+            
+            # Realizar scroll suave en pasos
+            num_steps = int(abs(target_scroll - current_scroll) / 100) + 1
+            for step in range(1, num_steps + 1):
+                current_position = current_scroll + (target_scroll - current_scroll) * (step / num_steps)
+                driver.execute_script(f"window.scrollTo(0, {current_position})")
+                time.sleep(smooth_speed / num_steps)
+        
+        # Verificar que ahora es visible
+        is_visible = driver.execute_script(
+            f"""
+            var element = document.evaluate(
+                "//div[contains(text(), '{hora}')]",
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+            
+            if (!element) return false;
+            
+            var rect = element.getBoundingClientRect();
+            return (
+                rect.top >= 0 &&
+                rect.left >= 0 &&
+                rect.bottom <= window.innerHeight &&
+                rect.right <= window.innerWidth
+            );
+            """
+        )
+        
+        if not is_visible:
+            return False, f"Elemento con hora {hora} no está visible en el viewport después del scroll"
+        
+        log("OK", f"Elemento con hora {hora} es ahora visible en pantalla")
+        return True, None
+        
+    except Exception as e:
+        return False, e
+
+
+def wait_for_horario_visible(driver, hora: str, timeout: int = 10) -> tuple[bool, str | Exception | None]:
+    """
+    Espera a que el elemento del horario sea visible y clickeable.
+    
+    Parámetros:
+      hora → string con la hora (ej: "08:30")
+      timeout → máximo de segundos a esperar
+    
+    Retorna (éxito, detalle_error).
+    """
+    try:
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        
+        log("INFO", f"Esperando a que horario {hora} sea visible y clickeable...")
+        
+        wait = WebDriverWait(driver, timeout)
+        element = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, f"//div[contains(text(), '{hora}')]")
+            )
+        )
+        
+        log("OK", f"Horario {hora} está visible")
+        return True, None
+        
     except Exception as e:
         return False, e
 
@@ -489,9 +653,9 @@ def extract_times_from_html(html: str) -> list[tuple]:
 
 def main():
     # Construir la URL default con la fecha de hoy en formato DD-MM-YYYY
-    today2 = '19-06-2026'
+    
     today = date.today().strftime("%d-%m-%Y")
-    default_url = f"https://www.turbus.cl/es/pasajes-bus/vi%C3%B1a-del-mar,-chile/santiago,-chile?date_onward={today2}"
+    default_url = f"https://www.turbus.cl/es/pasajes-bus/vi%C3%B1a-del-mar,-chile/santiago,-chile?date_onward={today}"
     
     parser = argparse.ArgumentParser(
         description="Extrae horarios de buses Turbus (Viña del Mar → Santiago) y los muestra en consola.",
@@ -576,9 +740,9 @@ def main():
             driver.quit()
         sys.exit(1)
 
-    # --- Paso 3: Extraer asientos disponibles para cada bus ---
+    # --- Paso 3: Extraer asientos disponibles para cada bus (ambos pisos) ---
     print()
-    log("STEP", "=== FASE 3: Extracción de asientos disponibles ===")
+    log("STEP", "=== FASE 3: Extracción de asientos disponibles (Pisos 1 y 2) ===")
     
     services_with_seats = []
     for idx, (hora, precio) in enumerate(services, start=1):
@@ -594,18 +758,46 @@ def main():
                 cause=click_error,
             )
         
-        # Extraer asientos disponibles
-        available_seats, layout_found, seats_error = extract_available_seats(driver)
-        if not layout_found:
+        # Diccionario para guardar asientos por piso
+        asientos_por_piso = {}
+        
+        # --- Extraer asientos del Piso 1 ---
+        available_seats_floor1, layout_found_floor1, seats_error_floor1 = extract_available_seats(driver)
+        if not layout_found_floor1:
             abort(
-                f"{service_label}: no se pudo extraer el mapa de asientos. Proceso detenido.",
+                f"{service_label}: no se pudo extraer el mapa de asientos del Piso 1. Proceso detenido.",
                 driver=driver,
-                cause=seats_error,
+                cause=seats_error_floor1,
             )
-
-        asientos_msg = ", ".join(available_seats) if available_seats else "(ninguno libre)"
-        log("OK", f"  {service_label}: {len(available_seats)} asiento(s) disponible(s): {asientos_msg}")
-        services_with_seats.append((hora, precio, available_seats))
+        
+        asientos_por_piso[1] = available_seats_floor1
+        asientos_msg_floor1 = ", ".join(available_seats_floor1) if available_seats_floor1 else "(ninguno)"
+        log("OK", f"  {service_label} Piso 1: {len(available_seats_floor1)} asiento(s) disponible(s): {asientos_msg_floor1}")
+        
+        # --- Intentar extraer asientos del Piso 2 ---
+        clicked_floor2, floor2_error = click_floor_button(driver, 2)
+        if not clicked_floor2:
+            # Si no puede hacer click en Piso 2, aborta el proceso
+            abort(
+                f"{service_label}: no se encontró botón de Piso 2. El bus no tiene segundo piso o la estructura cambió. Proceso detenido.",
+                driver=driver,
+                cause=floor2_error,
+            )
+        
+        available_seats_floor2, layout_found_floor2, seats_error_floor2 = extract_available_seats(driver)
+        if not layout_found_floor2:
+            abort(
+                f"{service_label}: no se pudo extraer el mapa de asientos del Piso 2. Proceso detenido.",
+                driver=driver,
+                cause=seats_error_floor2,
+            )
+        
+        asientos_por_piso[2] = available_seats_floor2
+        asientos_msg_floor2 = ", ".join(available_seats_floor2) if available_seats_floor2 else "(ninguno)"
+        log("OK", f"  {service_label} Piso 2: {len(available_seats_floor2)} asiento(s) disponible(s): {asientos_msg_floor2}")
+        
+        # Guardar datos del bus con asientos de ambos pisos
+        services_with_seats.append((hora, precio, asientos_por_piso))
         
         # Volver a la lista de servicios
         went_back, back_error = go_back_from_seats(driver)
@@ -630,9 +822,19 @@ def main():
 
     log("OK", f"Se encontraron {len(services_with_seats)} horarios disponibles:")
     print()
-    for i, (hora, precio, asientos) in enumerate(services_with_seats, start=1):
-        asientos_str = ", ".join(asientos) if asientos else "Sin asientos disponibles"
-        print(f"  {i:2d}. {hora}  →  {precio}  →  Asientos: {asientos_str}")
+    for i, (hora, precio, asientos_por_piso) in enumerate(services_with_seats, start=1):
+        print(f"  {i:2d}. Bus {hora}  →  {precio}")
+        
+        # Mostrar asientos del Piso 1
+        asientos_piso1 = asientos_por_piso.get(1, [])
+        asientos_str_piso1 = ", ".join(asientos_piso1) if asientos_piso1 else "Sin asientos disponibles"
+        print(f"       Piso 1: {asientos_str_piso1}")
+        
+        # Mostrar asientos del Piso 2
+        asientos_piso2 = asientos_por_piso.get(2, [])
+        asientos_str_piso2 = ", ".join(asientos_piso2) if asientos_piso2 else "Sin asientos disponibles"
+        print(f"       Piso 2: {asientos_str_piso2}")
+        print()
 
     print()
     first_time, first_price, _ = services_with_seats[0]
