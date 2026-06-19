@@ -330,19 +330,49 @@ def extract_available_seats(driver) -> tuple[list[str], bool, str | None]:
         return [], False, e
 
 
-def click_purchase_button(driver) -> tuple[bool, str | Exception | None]:
+def click_purchase_button(driver, hora: str) -> tuple[bool, str | Exception | None]:
     """
-    Hace click en el botón "Comprar" para ver los asientos disponibles.
+    Hace click en el botón "Comprar" para ver los asientos disponibles,
+    buscando el botón específico que está en el mismo contenedor del horario actual.
+    
+    Parámetros:
+      hora → string con la hora (ej: "08:30") - usada para encontrar el contenedor correcto
+    
+    Estrategia:
+      1. Buscar el contenedor del servicio que contiene el horario
+      2. Dentro de ese contenedor, encontrar el botón "Comprar" específico
     
     Retorna (éxito, detalle_error).
     """
     try:
-        button = driver.find_element(By.XPATH, "//button[.//span[text()='Comprar']]")
+        # Buscar el contenedor del servicio que contiene el horario
+        # Usamos XPath para encontrar el elemento del servicio que contiene el texto de la hora específica
+        service_item = driver.find_element(
+            By.XPATH,
+            f"//div[@class='service-item_service_item__1JAq8'][.//div[contains(text(), '{hora}')]]"
+        )
         
+        # Dentro de este contenedor del servicio, buscar el botón "Comprar"
+        button = service_item.find_element(By.XPATH, ".//button[.//span[text()='Comprar']]")
+        
+        log("INFO", f"Botón 'Comprar' encontrado para horario {hora}")
         time.sleep(0.5)
         button.click()
-        log("OK", "Botón 'Comprar' clickeado")
-        time.sleep(20)  # Esperar a que carguen los asientos
+        log("OK", f"Botón 'Comprar' clickeado para horario {hora}")
+        time.sleep(8)  # Esperar a que carguen los asientos
+        
+        # Mini scroll suave hacia arriba para que el mapa de asientos quede visible
+        # desde la parte superior de la página y los botones de piso sean accesibles
+        current_scroll = driver.execute_script("return window.pageYOffset")
+        if current_scroll > 0:
+            log("INFO", "Haciendo mini scroll hacia arriba para ver el mapa de asientos...")
+            num_steps = max(1, int(current_scroll / 80))
+            for step in range(1, num_steps + 1):
+                position = current_scroll * (1 - step / num_steps)
+                driver.execute_script(f"window.scrollTo(0, {position})")
+                time.sleep(0.025)
+            log("OK", "Mini scroll hacia arriba completado")
+        
         return True, None
     except Exception as e:
         return False, e
@@ -379,19 +409,6 @@ def click_floor_button(driver, floor_number: int) -> tuple[bool, str | Exception
         return False, e
 
 
-def go_back_from_seats(driver) -> tuple[bool, str | Exception | None]:
-    """
-    Vuelve atrás desde la pantalla de selección de asientos.
-    
-    Retorna (éxito, detalle_error).
-    """
-    try:
-        driver.back()
-        time.sleep(1)
-        log("OK", "Navegador retrocedió a la lista de servicios")
-        return True, None
-    except Exception as e:
-        return False, e
 
 
 def scroll_to_element(driver, hora: str, smooth_speed: float = 0.5) -> tuple[bool, str | Exception | None]:
@@ -507,6 +524,30 @@ def wait_for_horario_visible(driver, hora: str, timeout: int = 10) -> tuple[bool
         log("OK", f"Horario {hora} está visible")
         return True, None
         
+    except Exception as e:
+        return False, e
+
+
+def close_seat_layout(driver) -> tuple[bool, str | Exception | None]:
+    """
+    Cierra el modal del mapa de asientos haciendo click en la X.
+    
+    Busca el elemento <img> con alt='close-window' dentro del modal
+    y hace click para cerrarlo, volviendo a la lista de horarios.
+    
+    Retorna (éxito, detalle_error).
+    """
+    try:
+        log("INFO", "Cerrando modal de asientos...")
+        close_img = driver.find_element(
+            By.XPATH,
+            "//img[@alt='close-window']"
+        )
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", close_img)
+        time.sleep(3)  # Esperar a que el modal se cierre completamente
+        log("OK", "Modal de asientos cerrado correctamente")
+        return True, None
     except Exception as e:
         return False, e
 
@@ -650,9 +691,9 @@ def extract_times_from_html(html: str) -> list[tuple]:
 
 def main():
     # Construir la URL default con la fecha de hoy en formato DD-MM-YYYY
-    
+    today2='19-06-2026'
     today = date.today().strftime("%d-%m-%Y")
-    default_url = f"https://www.turbus.cl/es/pasajes-bus/vi%C3%B1a-del-mar,-chile/santiago,-chile?date_onward={today}"
+    default_url = f"https://www.turbus.cl/es/pasajes-bus/vi%C3%B1a-del-mar,-chile/santiago,-chile?date_onward={today2}"
     
     parser = argparse.ArgumentParser(
         description="Extrae horarios de buses Turbus (Viña del Mar → Santiago) y los muestra en consola.",
@@ -746,8 +787,18 @@ def main():
         service_label = f"Bus {idx}/{len(services)} ({hora})"
         log("INFO", f"Procesando {service_label}...")
         
+        # Scroll hacia el horario actual para asegurar que es visible
+        scrolled, scroll_error = scroll_to_element(driver, hora)
+        if not scrolled:
+            abort(
+                f"{service_label}: no se pudo encontrar el horario en la página. "
+                f"Proceso detenido.",
+                driver=driver,
+                cause=scroll_error,
+            )
+        
         # Hacer click en el botón Comprar
-        clicked, click_error = click_purchase_button(driver)
+        clicked, click_error = click_purchase_button(driver, hora)
         if not clicked:
             abort(
                 f"{service_label}: no se pudo abrir la pantalla de asientos. Proceso detenido.",
@@ -796,13 +847,13 @@ def main():
         # Guardar datos del bus con asientos de ambos pisos
         services_with_seats.append((hora, precio, asientos_por_piso))
         
-        # Volver a la lista de servicios
-        went_back, back_error = go_back_from_seats(driver)
-        if not went_back:
+        # Cerrar el modal de asientos antes de pasar al siguiente horario
+        closed, close_error = close_seat_layout(driver)
+        if not closed:
             abort(
-                f"{service_label}: no se pudo volver a la lista de servicios. Proceso detenido.",
+                f"{service_label}: no se pudo cerrar el modal de asientos. Proceso detenido.",
                 driver=driver,
-                cause=back_error,
+                cause=close_error,
             )
         
         time.sleep(1)  # Pausa entre buses para no sobrecargar
