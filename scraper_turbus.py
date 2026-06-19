@@ -361,17 +361,8 @@ def click_purchase_button(driver, hora: str) -> tuple[bool, str | Exception | No
         log("OK", f"Botón 'Comprar' clickeado para horario {hora}")
         time.sleep(8)  # Esperar a que carguen los asientos
         
-        # Mini scroll suave hacia arriba para que el mapa de asientos quede visible
-        # desde la parte superior de la página y los botones de piso sean accesibles
-        current_scroll = driver.execute_script("return window.pageYOffset")
-        if current_scroll > 0:
-            log("INFO", "Haciendo mini scroll hacia arriba para ver el mapa de asientos...")
-            num_steps = max(1, int(current_scroll / 80))
-            for step in range(1, num_steps + 1):
-                position = current_scroll * (1 - step / num_steps)
-                driver.execute_script(f"window.scrollTo(0, {position})")
-                time.sleep(0.025)
-            log("OK", "Mini scroll hacia arriba completado")
+        # Mini scroll hacia arriba (20px) para que los botones de piso queden visibles
+        driver.execute_script("window.scrollBy(0, -20)")
         
         return True, None
     except Exception as e:
